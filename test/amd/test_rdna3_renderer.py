@@ -54,7 +54,6 @@ class TestRDNA3Isel(unittest.TestCase):
     self.assertEqual(n.src[0].arg, s_endpgm)
 
   def test_global_load_b32(self):
-    from tinygrad.runtime.autogen.amd.rdna3.ins import global_load_b32
     base = UOp(Ops.PARAM, dtypes.float.ptr(256), (), 0)
     offset = UOp.variable("offset", 0, 255, dtypes.int)
     load = base.index(offset, ptr=True).load()
@@ -68,12 +67,10 @@ class TestRDNA3Isel(unittest.TestCase):
     self.assertEqual(n.src[1].arg, 0)
     self.assertEqual(n.src[1].dtype, dtypes.float.ptr(256))
 
-
     self.assertEqual(n.src[0].op, Ops.DEFINE_VAR)
     self.assertEqual(n.src[1].op, Ops.PARAM)
 
   def test_global_store_b32(self):
-    from tinygrad.runtime.autogen.amd.rdna3.ins import global_store_b32
     base = UOp(Ops.PARAM, dtypes.float.ptr(256), (), 0)
     offset = UOp.variable("offset", 0, 255, dtypes.int)
     val = UOp.variable("val", 0, 0, dtypes.float)
@@ -91,11 +88,9 @@ class TestRDNA3Isel(unittest.TestCase):
     self.assertEqual(n.src[2].arg, 0)
     self.assertEqual(n.src[2].dtype, dtypes.float.ptr(256))
 
-
     self.assertEqual(n.src[0].op, Ops.DEFINE_VAR)
     self.assertEqual(n.src[1].op, Ops.DEFINE_VAR)
     self.assertEqual(n.src[2].op, Ops.PARAM)
-
 
   def test_full_add_one_kernel(self):
       """
@@ -175,6 +170,44 @@ class TestRDNA3Isel(unittest.TestCase):
       self.assertEqual(special2.op, Ops.SPECIAL)
       self.assertEqual(special2.arg, 'lidx0')
       self.assertIs(special2, special)  # shared reference, same UOp object
+
+  def test_assemble_add_one_elf(self):
+      """Handcraft the instruction list, feed it to assemble_linear, get ELF bytes."""
+      from tinygrad.renderer.amd.elf import assemble_linear
+      from tinygrad.runtime.autogen.amd.rdna3.ins import (
+          s_load_b64, s_waitcnt_vmcnt, s_waitcnt_lgkmcnt, global_load_b32, global_store_b32,
+          v_lshlrev_b32_e32, v_mov_b32_e32, v_add_f32_e32, s_endpgm,
+      )
+      from tinygrad.renderer.amd.dsl import v, s, NULL
+      from tinygrad.uop.ops import KernelInfo
+
+      A = UOp(Ops.PARAM, dtypes.float.ptr(256), (), 0)
+
+      assert dtypes.is_float(A.dtype.base), f"buffer dtype must be float32, got {A.dtype}"
+      threads = UOp.special(A.numel(), "lidx0")
+      insts = [
+        s_load_b64(s[0:1], s[0:1], soffset=NULL),
+        s_waitcnt_lgkmcnt(sdst=NULL, simm16=0),
+        v_lshlrev_b32_e32(v[0], 2, v[0]), # element offset
+        global_load_b32(v[1], v[0], saddr=s[0:1]),
+        s_waitcnt_vmcnt(sdst=NULL, simm16=0),
+        v_mov_b32_e32(v[2], 1.0),
+        v_add_f32_e32(v[1], v[1], v[2]),
+        global_store_b32(addr=v[0], data=v[1], saddr=s[0:1]),
+        s_endpgm(),
+      ]
+
+      lin = UOp(Ops.LINEAR, src=tuple([UOp(Ops.INS, arg=x) for x in insts]))
+      sink = UOp.sink(A, threads, arg=KernelInfo(f"custom_add_one_{A.numel()}"))
+      prg=  UOp(Ops.PROGRAM, src=(sink, UOp(Ops.DEVICE, arg="AMD"), lin))
+
+      elf_bytes = assemble_linear(prg, lin, arch='gfx1100')
+      self.assertTrue(elf_bytes[:4] == b'\x7fELF')
+      print(f"ELF size: {len(elf_bytes)} bytes")
+      print(elf_bytes)
+      with open(".dev/elf_test.elf", "wb") as f:
+        f.write(elf_bytes)
+      assert(0)
 
 if __name__ == "__main__":
   unittest.main()
