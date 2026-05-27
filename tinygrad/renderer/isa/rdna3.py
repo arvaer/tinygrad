@@ -2,14 +2,15 @@ from tinygrad.renderer.isa import ISARenderer, Register, IselContext
 from tinygrad.helpers import Target
 from tinygrad.uop.ops import UOp, UPat, PatternMatcher
 from tinygrad.renderer.amd.dsl import Inst
-from tinygrad.dtype import dtypes
+from tinygrad.dtype import dtypes, PtrDType
 from tinygrad.uop import Ops
 
 from tinygrad.runtime.autogen.amd.rdna3 import ins as RDNA3Ins
 
 pre_isel_matcher = PatternMatcher([])
 
-
+SGPR = tuple(Register(f"s[{i}]", i) for i in range(106))
+VGPR = tuple(Register(f"v[{i}]", 256+i) for i in range(256))
 def alloc_vregs(ctx:IselContext, x:UOp) -> UOp|None:
   """
   SALu(sop*) -> sgpr
@@ -22,6 +23,7 @@ def alloc_vregs(ctx:IselContext, x:UOp) -> UOp|None:
   """
 
   if x.dtype is dtypes.void: return None
+  print("allocing vreg for: ", x.op)
   if isinstance(x.arg, Inst):
     inst = x.arg
     #SALU
@@ -45,12 +47,12 @@ def alloc_vregs(ctx:IselContext, x:UOp) -> UOp|None:
 
 pkernarg_segment = (Register("s[0]", 0), Register("s[1]", 1))
 def abi(ctx:IselContext, x:UOp) -> UOp|None:
-  from tinygrad.dtype import PtrDType
+  print("abi")
   if isinstance(x.tag, tuple): return None # register
   i = ctx.func_args.index(x)
   #t_id goes to v[0]
   if x.op is Ops.SPECIAL:
-    return x.ins(RDNA3Ins.v_mov_b32_e32, src = (x.replace(tag=(VGPR[0],)),))
+    return x.ins(RDNA3Ins.v_mov_b32_e32(), src = (x.replace(tag=(VGPR[0],)),))
 
   params = [u for u in ctx.func_args if u.op is Ops.PARAM]
   param_idx = params.index(x)
@@ -62,18 +64,25 @@ def abi(ctx:IselContext, x:UOp) -> UOp|None:
     n_bufs = sum(1 for u in params if isinstance(u.dtype, PtrDType))
     var_idx = param_idx - n_bufs
     return x.ins(RDNA3Ins.s_load_b32(offset=n_bufs * 8 + var_idx * 4), src=(base,))
-
-def lower_index(x:UOp, base:UOp, idx:Uop) -> UOp:
-  byte_scale = base.dtype.itemsize
+  
+def shift_index(x:UOp, base:UOp, idx:UOp) -> UOp:
+  """
+  Index(base, idx) -> needs idx * size to caluclate offset.
+  v_lshlrev_b32: dst = src1 << src0 
+  """
+  print("x for op: ", x)
+  byte_scale = base.dtype.itemsize if isinstance(base.dtype, PtrDType) else 1
   shift = {1:0, 2:1, 4:2, 8:3}[byte_scale]
+  if shift == 0: return idx
   shift_imm = UOp.const(dtypes.int, shift)
-  return x.ins(RDNA3Ins.v_lshlrev_b32_e32, src=(shift_imm, idx))
+  return x.ins(RDNA3Ins.v_lshlrev_b32_e32(), src=(shift_imm, idx))
 
 isel_matcher = PatternMatcher([
   (UPat(Ops.PARAM, name="x"),  abi),
   (UPat(Ops.SPECIAL, name="x"), abi), 
-  (UPat.cvar("x", dtypes.float32), lambda x: x.ins(RDNA3Ins.v_mov_b32_e32, src = (x,)) if not x.tag else None), # already done
-  (UPat.cvar("x", dtypes.int), lambda x: x.ins(RDNA3Ins.v_mov_b32_e32, src = (x,)) if not x.tag else None), # already done
+  #(UPat.cvar("x", dtypes.float32), lambda x: x.ins(RDNA3Ins.v_mov_b32_e32, src = (x,)) if not x.tag else None), # already done
+ # (UPat.cvar("x", dtypes.int), lambda x: x.ins(RDNA3Ins.v_mov_b32_e32, src = (x,)) if not x.tag else None), # already done
+ (UPat(Ops.RANGE, name="x"), lambda ctx, x: x.replace(tag=(ctx.vreg(VGPR),)) if not isinstance(x.tag, tuple) else None),
   (UPat(
     Ops.LOAD,
     src=(
@@ -81,11 +90,12 @@ isel_matcher = PatternMatcher([
         Ops.INDEX,
         src=(
           UPat(name="base"),
-          UPat(name="offset")))), name="x"),
-   lambda x, base, offset: x.ins(RDNA3Ins.global_load_b32, src=(offset, base))),
+          UPat(name="idx")))), name="x"),
+   lambda x, base, idx: x.ins(RDNA3Ins.global_load_b32(), src=(shift_index(x,base,idx), base))),
 
-  (UPat.var("a", dtypes.float32) + UPat.var("b", dtype=dtypes.float32), lambda a, b: a.ins(RDNA3Ins.v_add_f32_e32, src = (a,b))),
-  (UPat.var("a", dtypes.float32) * UPat.var("b", dtype=dtypes.float32), lambda a, b: a.ins(RDNA3Ins.v_mul_f32_e32, src = (a,b))),
+
+  (UPat.var("a", dtypes.float32) + UPat.var("b", dtype=dtypes.float32), lambda a, b: a.ins(RDNA3Ins.v_add_f32_e32(), src = (a,b))),
+  (UPat.var("a", dtypes.float32) * UPat.var("b", dtype=dtypes.float32), lambda a, b: a.ins(RDNA3Ins.v_mul_f32_e32(), src = (a,b))),
 
   (UPat(
     Ops.STORE,
@@ -94,19 +104,37 @@ isel_matcher = PatternMatcher([
         Ops.INDEX,
         src=(
           UPat(name="base"),
-          UPat(name="offset"))),
+          UPat(name="idx"))),
       UPat(name="val")), name="x"),
-   lambda x, base, offset, val: x.ins(RDNA3Ins.global_store_b32, src=(offset, val, base))),
+   lambda x, base, idx, val: x.ins(RDNA3Ins.global_store_b32(), src=(shift_index(x, base, idx), val, base))),
 
-  (UPat(Ops.SINK, name="x"), lambda x: x.replace(src=(x.ins(RDNA3Ins.s_endpgm, src=x.src),)) if not x.src or x.src[0].op is not Ops.INS else None),
+  (UPat(Ops.SINK, name="x"), lambda x: x.replace(src=(x.ins(RDNA3Ins.s_endpgm(), src=x.src),)) if not x.src or x.src[0].op is not Ops.INS else None),
   (UPat((Ops.INS,), name="x"), alloc_vregs)
 ])
 
-SGPR = tuple(Register(f"s[{i}]", i) for i in range(106))
-VGPR = tuple(Register(f"v[{i}]", 256+i) for i in range(256))
+def lower_range(ctx, x:UOp):
+  label_id = "_".join(str(i) for i in  x.arg[:-1])
 
+  zero = x.ins(RDNA3Ins.s_mov_b32(), src=(UOp.const(x.dtype, 0),))
+  label = UOp(Ops.INS, arg=RDNA3Ins.s_nop(), tag=f".LOOP_{label_id}")
+  cmmp = UOp(Ops.INS, arg=RDNA3Ins.s_cmp_ge_u32(), src=(zero, x.src[0]))
+  branch = UOp(Ops.INS, arg=RDNA3Ins.s_cbranch_scc1(), src=(cmmp,), tag=f".LOOP_OUT_{label_id}")
+  ctx.loop_label[zero] = label_id
 
-post_regalloc_matcher = PatternMatcher([])
+  return (zero, [zero, label, cmmp, branch])
+
+def lower_end(ctx, x:UOp):
+  range_uop = x.src[1]
+  label_id = ctx.loop_label[range_uop]
+  inc = range_uop.ins(RDNA3Ins.s_add_u32(), src=(UOp.const(range_uop.dtype, 1),))
+  jmp = UOp(Ops.INS, arg=RDNA3Ins.s_branch(), tag=f".LOOP_{label_id}")
+  out = UOp(Ops.INS, arg=RDNA3Ins.s_nop(), tag=f".LOOP_OUT_{label_id}")
+  return (jmp, [inc,jmp,out])
+
+post_regalloc_matcher = PatternMatcher([
+  (UPat(Ops.RANGE, name="x"), lower_range),
+  (UPat(Ops.END, name="x"), lower_end),
+])
 
 class RDNA3Renderer(ISARenderer):
   shared_max = 65536
@@ -129,8 +157,27 @@ class RDNA3Renderer(ISARenderer):
     raise NotImplementedError("no stack")
 
   def asm_str(self, uops:list[UOp], function_name:str) -> str:
-    print(f"\n=== {function_name} ===")
+    asm = [f".{function_name}"]
     for u in uops:
-        print(f"  {u.op} {u.dtype} {u.arg}")
-    return ""
-    exit(1)
+      if u is not Ops.INS: continue
+      reg_str = str(u.reg) if u.reg else ""
+      srcs = ", ".join(str(s.reg) if s.reg else str(s.arg) for s in u.src)
+      asm.append(f"  {str(u.arg):40s} {reg_str:10s} <- {srcs}")
+    return "\n".join(asm)
+
+  def render(self, uops:list[UOp]) -> str:
+    targets: dict[str, int] = {}
+    jumps: dict[UOp, int] = {}
+    binary = bytearray()
+    for u in uops:
+      if u.op is not Ops.INS: continue
+      inst = u.arg
+
+      if isinstance(u.tag, str) and u.tag.startswith("."):
+        targets[u.tag] = len(binary)
+        continue
+
+      filled = self.fill_regs(u)
+      binary.extend(filled.to_bytes())
+
+  def supported_dtypes(self): return {d for d in super().supported_dtypes() if d not in dtypes.fp8s+(dtypes.bfloat16,)}
