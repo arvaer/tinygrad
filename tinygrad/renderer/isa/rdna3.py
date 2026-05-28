@@ -11,6 +11,7 @@ pre_isel_matcher = PatternMatcher([])
 
 SGPR = tuple(Register(f"s[{i}]", i) for i in range(106))
 VGPR = tuple(Register(f"v[{i}]", 256+i) for i in range(256))
+
 def alloc_vregs(ctx:IselContext, x:UOp) -> UOp|None:
   """
   SALu(sop*) -> sgpr
@@ -75,7 +76,7 @@ def shift_index(x:UOp, base:UOp, idx:UOp) -> UOp:
   shift = {1:0, 2:1, 4:2, 8:3}[byte_scale]
   if shift == 0: return idx
   shift_imm = UOp.const(dtypes.int, shift)
-  return x.ins(RDNA3Ins.v_lshlrev_b32_e32(), src=(shift_imm, idx))
+  return x.ins(RDNA3Ins.v_lshlrev_b32_e32(), src=(shift_imm, idx), dtype=dtypes.int)
 
 isel_matcher = PatternMatcher([
   (UPat(Ops.PARAM, name="x"),  abi),
@@ -94,9 +95,9 @@ isel_matcher = PatternMatcher([
    lambda x, base, idx: x.ins(RDNA3Ins.global_load_b32(), src=(shift_index(x,base,idx), base))),
 
 
+
   (UPat.var("a", dtypes.float32) + UPat.var("b", dtype=dtypes.float32), lambda a, b: a.ins(RDNA3Ins.v_add_f32_e32(), src = (a,b))),
   (UPat.var("a", dtypes.float32) * UPat.var("b", dtype=dtypes.float32), lambda a, b: a.ins(RDNA3Ins.v_mul_f32_e32(), src = (a,b))),
-
   (UPat(
     Ops.STORE,
     src=(
@@ -107,12 +108,13 @@ isel_matcher = PatternMatcher([
           UPat(name="idx"))),
       UPat(name="val")), name="x"),
    lambda x, base, idx, val: x.ins(RDNA3Ins.global_store_b32(), src=(shift_index(x, base, idx), val, base))),
-
   (UPat(Ops.SINK, name="x"), lambda x: x.replace(src=(x.ins(RDNA3Ins.s_endpgm(), src=x.src),)) if not x.src or x.src[0].op is not Ops.INS else None),
   (UPat((Ops.INS,), name="x"), alloc_vregs)
 ])
 
 def lower_range(ctx, x:UOp):
+  print('lower range')
+
   label_id = "_".join(str(i) for i in  x.arg[:-1])
 
   zero = x.ins(RDNA3Ins.s_mov_b32(), src=(UOp.const(x.dtype, 0),))
@@ -124,6 +126,7 @@ def lower_range(ctx, x:UOp):
   return (zero, [zero, label, cmmp, branch])
 
 def lower_end(ctx, x:UOp):
+  print('lower end')
   range_uop = x.src[1]
   label_id = ctx.loop_label[range_uop]
   inc = range_uop.ins(RDNA3Ins.s_add_u32(), src=(UOp.const(range_uop.dtype, 1),))
@@ -172,12 +175,68 @@ class RDNA3Renderer(ISARenderer):
     for u in uops:
       if u.op is not Ops.INS: continue
       inst = u.arg
+      print("*"*50)
+      print(f"  {u.arg}  tag={u.tag}  src_tags={[s.tag for s in u.src]}")
+      print("*"*50)
+
 
       if isinstance(u.tag, str) and u.tag.startswith("."):
         targets[u.tag] = len(binary)
         continue
 
-      filled = self.fill_regs(u)
+      print(u)
+      
+      filled = self.fill(u)
       binary.extend(filled.to_bytes())
+
+  def fill(self, u:UOp) -> Inst:
+      from tinygrad.renderer.amd.dsl import Reg
+      def to_reg(s):
+          """Convert a UOp source to a Reg for instruction encoding."""
+          if s.op is Ops.CONST:
+              # inline float constants (§6.2 p.47)
+              float_map = {0.5: 240, -0.5: 241, 1.0: 242, -1.0: 243,
+                          2.0: 244, -2.0: 245, 4.0: 246, -4.0: 247}
+              v = s.arg if not hasattr(s.arg, 'val') else s.arg.val
+              if isinstance(v, float) and v in float_map:
+                  return Reg(float_map[v], 1)
+              # inline integer constants: 0→128, 1-64→129-192, -1 to -16→193-208
+              if isinstance(v, int):
+                  if v == 0: return Reg(128, 1)
+                  if 1 <= v <= 64: return Reg(128 + v, 1)
+                  if -16 <= v <= -1: return Reg(192 - v, 1)
+              # doesn't fit inline → 32-bit literal (encoding 255)
+              return Reg(255, 1)  # TODO: append literal bytes
+          # regular register source
+          r = s.reg
+          if isinstance(r, Reg): return r
+          elif isinstance(r, Register): return Reg(r.index, 1)
+          else:
+            raise TypeError(f"oopsies for {s}")
+
+      inst = u.arg
+      regs = [to_reg(s) for s in u.src]
+      dst = Reg(u.tag[0].index, 1) if isinstance(u.tag, tuple) else None
+
+      print('filling for uop: ', u.arg)
+      if isinstance(inst, RDNA3Ins.VOP2):
+        return type(inst)(inst.op, vdst=dst, src0=regs[0], vsrc1=regs[1])
+      elif isinstance(inst, RDNA3Ins.VOP1):
+        return type(inst)(inst.op, vdst=dst, src0=regs[0])
+      elif isinstance(inst, RDNA3Ins.GLOBAL):
+        if dst:  # load
+          return type(inst)(inst.op, vdst=dst, addr=regs[0], saddr=regs[1])
+        else:    # store
+          return type(inst)(inst.op, addr=regs[0], data=regs[1], saddr=regs[2])
+      elif isinstance(inst, RDNA3Ins.SMEM):
+        return type(inst)(inst.op, sdata=dst, sbase=regs[0], offset=inst.offset)
+      elif isinstance(inst, (RDNA3Ins.SOP1,)):
+        return type(inst)(inst.op, sdst=dst, src0=regs[0])
+      elif isinstance(inst, (RDNA3Ins.SOP2,)):
+        return type(inst)(inst.op, sdst=dst, src0=regs[0], src1=regs[1])
+      elif isinstance(inst, RDNA3Ins.SOPP):
+        return inst  # no register fields
+      else:
+        raise RuntimeError(f"fill_regs: unhandled {type(inst).__name__}")
 
   def supported_dtypes(self): return {d for d in super().supported_dtypes() if d not in dtypes.fp8s+(dtypes.bfloat16,)}
