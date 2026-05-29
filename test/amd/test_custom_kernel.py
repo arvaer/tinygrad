@@ -168,12 +168,14 @@ class TestCustomKernel(unittest.TestCase):
   def test_simple(self):
     if self.arch != "rdna3": self.skipTest("only rdna3")
     a = Tensor.full((16, 16), 1.).contiguous().realize()
+    print("beforE:", a.numpy())
     a = Tensor.custom_kernel(a, fxn=custom_add_one)[0]
     linear = compile_linear(a.schedule_linear())
     est = estimate_uop(linear.src[-1])
     self.assertEqual(est.ops, a.numel())
     self.assertEqual(est.mem, a.nbytes()*2)
     run_linear(linear)
+    print(a.numpy())
     self.assertTrue((a.numpy() == 2.).all())
 
   def test_variable(self):

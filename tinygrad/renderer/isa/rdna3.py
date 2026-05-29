@@ -1,7 +1,7 @@
 from tinygrad.renderer.isa import ISARenderer, Register, IselContext
 from tinygrad.helpers import Target
 from tinygrad.uop.ops import UOp, UPat, PatternMatcher
-from tinygrad.renderer.amd.dsl import Inst
+from tinygrad.renderer.amd.dsl import Inst, NULL
 from tinygrad.dtype import dtypes, PtrDType
 from tinygrad.uop import Ops
 
@@ -24,7 +24,7 @@ def alloc_vregs(ctx:IselContext, x:UOp) -> UOp|None:
   """
 
   if x.dtype is dtypes.void: return None
-  print("allocing vreg for: ", x.op)
+  if isinstance(x.tag, tuple) and x.tag[0]._cons: return None
   if isinstance(x.arg, Inst):
     inst = x.arg
     #SALU
@@ -44,15 +44,19 @@ def alloc_vregs(ctx:IselContext, x:UOp) -> UOp|None:
 
     else:
       raise RuntimeError(f"unhandled instruction class {type(inst).__name___}")
+    return x.replace(tag=tuple(defs))
 
 
 pkernarg_segment = (Register("s[0]", 0), Register("s[1]", 1))
 def abi(ctx:IselContext, x:UOp) -> UOp|None:
-  print("abi")
   if isinstance(x.tag, tuple): return None # register
   i = ctx.func_args.index(x)
   #t_id goes to v[0]
   if x.op is Ops.SPECIAL:
+    if x.arg.startswith('gidx'):
+      n = int(x.arg[-1])
+      wg = Register(f"s[{2+n}]", 2+n)
+      return x.ins(RDNA3Ins.v_mov_b32_e32(), src = (x.replace(tag=(wg,)),))
     return x.ins(RDNA3Ins.v_mov_b32_e32(), src = (x.replace(tag=(VGPR[0],)),))
 
   params = [u for u in ctx.func_args if u.op is Ops.PARAM]
@@ -60,18 +64,22 @@ def abi(ctx:IselContext, x:UOp) -> UOp|None:
   base = x.replace(tag=tuple(pkernarg_segment))
 
   if isinstance(x.dtype, PtrDType):
-    return x.ins(RDNA3Ins.s_load_b64(offset=param_idx*8), src=(base,))
+    load = x.ins(RDNA3Ins.s_load_b64(offset=param_idx*8), src=(base,))
   else:
     n_bufs = sum(1 for u in params if isinstance(u.dtype, PtrDType))
     var_idx = param_idx - n_bufs
-    return x.ins(RDNA3Ins.s_load_b32(offset=n_bufs * 8 + var_idx * 4), src=(base,))
+    load = x.ins(RDNA3Ins.s_load_b32(offset=n_bufs * 8 + var_idx * 4), src=(base,))
+  # s_load is async: the value isn't in the sgpr until the lgkmcnt scoreboard drains. emit a wait, then
+  # carry the loaded register through an AFTER so consumers are ordered *after* the wait (which is ordered
+  # after the load). AFTER is a regalloc pseudo-op (no reg of its own); UOp.reg passes through to src[0]=load.
+  wait = UOp(Ops.INS, dtypes.void, src=(load,), arg=RDNA3Ins.s_waitcnt_lgkmcnt(sdst=NULL, simm16=0))
+  return UOp(Ops.AFTER, x.dtype, src=(load, wait))
   
 def shift_index(x:UOp, base:UOp, idx:UOp) -> UOp:
   """
   Index(base, idx) -> needs idx * size to caluclate offset.
   v_lshlrev_b32: dst = src1 << src0 
   """
-  print("x for op: ", x)
   byte_scale = base.dtype.itemsize if isinstance(base.dtype, PtrDType) else 1
   shift = {1:0, 2:1, 4:2, 8:3}[byte_scale]
   if shift == 0: return idx
@@ -81,8 +89,9 @@ def shift_index(x:UOp, base:UOp, idx:UOp) -> UOp:
 isel_matcher = PatternMatcher([
   (UPat(Ops.PARAM, name="x"),  abi),
   (UPat(Ops.SPECIAL, name="x"), abi), 
-  #(UPat.cvar("x", dtypes.float32), lambda x: x.ins(RDNA3Ins.v_mov_b32_e32, src = (x,)) if not x.tag else None), # already done
- # (UPat.cvar("x", dtypes.int), lambda x: x.ins(RDNA3Ins.v_mov_b32_e32, src = (x,)) if not x.tag else None), # already done
+  (UPat.cvar("x", dtypes.float32), lambda ctx, x: x.ins(RDNA3Ins.v_mov_b32_e32(), src = (x.replace(tag=(ctx.vreg,)),)) if not x.tag else None),
+  #(UPat.cvar("x", dtypes.int),     lambda ctx, x: x.ins(RDNA3Ins.v_mov_b32_e32(), src = (x.replace(tag=(ctx.vreg,)),)) if not x.tag else None),
+
  (UPat(Ops.RANGE, name="x"), lambda ctx, x: x.replace(tag=(ctx.vreg(VGPR),)) if not isinstance(x.tag, tuple) else None),
   (UPat(
     Ops.LOAD,
@@ -113,8 +122,6 @@ isel_matcher = PatternMatcher([
 ])
 
 def lower_range(ctx, x:UOp):
-  print('lower range')
-
   label_id = "_".join(str(i) for i in  x.arg[:-1])
 
   zero = x.ins(RDNA3Ins.s_mov_b32(), src=(UOp.const(x.dtype, 0),))
@@ -126,7 +133,6 @@ def lower_range(ctx, x:UOp):
   return (zero, [zero, label, cmmp, branch])
 
 def lower_end(ctx, x:UOp):
-  print('lower end')
   range_uop = x.src[1]
   label_id = ctx.loop_label[range_uop]
   inc = range_uop.ins(RDNA3Ins.s_add_u32(), src=(UOp.const(range_uop.dtype, 1),))
@@ -137,6 +143,10 @@ def lower_end(ctx, x:UOp):
 post_regalloc_matcher = PatternMatcher([
   (UPat(Ops.RANGE, name="x"), lower_range),
   (UPat(Ops.END, name="x"), lower_end),
+  # everything that isn't an instruction (SINK, operand leaves like CONST/PARAM/SPECIAL, defines, etc.) holds
+  # its register/metadata in .tag or in the sink; the INS that consume them bake it in via fill(). drop them
+  # all so LINEAR.src is all-INS — what do_assemble requires. RANGE/END are already lowered to INS above.
+  (UPat(tuple(o for o in Ops if o not in (Ops.INS, Ops.RANGE, Ops.END)), name="x"), lambda x: (x, [])),
 ])
 
 class RDNA3Renderer(ISARenderer):
@@ -175,29 +185,37 @@ class RDNA3Renderer(ISARenderer):
     for u in uops:
       if u.op is not Ops.INS: continue
       inst = u.arg
-      print("*"*50)
-      print(f"  {u.arg}  tag={u.tag}  src_tags={[s.tag for s in u.src]}")
-      print("*"*50)
-
 
       if isinstance(u.tag, str) and u.tag.startswith("."):
         targets[u.tag] = len(binary)
         continue
 
-      print(u)
-      
       filled = self.fill(u)
       binary.extend(filled.to_bytes())
+    return binary.hex()
+
+  def asm(self, prg:UOp, lin:UOp) -> bytes:
+    # bake each instruction's allocated registers (held in tags) into its Inst, then pack the code object
+    # (ELF + kernel descriptor). assemble_linear reads kernarg size / workgroup ids from prg's sink and
+    # scans the filled Insts for max vgpr/sgpr — so the args must carry real Reg fields here.
+    from tinygrad.renderer.amd.elf import assemble_linear
+    def _bake(u:UOp) -> UOp:
+      if not u.src and not isinstance(u.tag, tuple):return u
+      return u.replace(arg=self.fill(u))
+    insts = tuple(_bake(u) for u in lin.src)
+    return assemble_linear(prg, lin.replace(src=insts), self.target.arch)
 
   def fill(self, u:UOp) -> Inst:
       from tinygrad.renderer.amd.dsl import Reg
+      def _reg_count(dt): return  2 if isinstance(dt, PtrDType) else max(1, dt.itemsize // 4)
       def to_reg(s):
           """Convert a UOp source to a Reg for instruction encoding."""
           if s.op is Ops.CONST:
               # inline float constants (§6.2 p.47)
               float_map = {0.5: 240, -0.5: 241, 1.0: 242, -1.0: 243,
                           2.0: 244, -2.0: 245, 4.0: 246, -4.0: 247}
-              v = s.arg if not hasattr(s.arg, 'val') else s.arg.val
+              v = s.arg if not hasattr(s.arg, 'val') else s.arg
+              if isinstance(v, float): v = float(v)
               if isinstance(v, float) and v in float_map:
                   return Reg(float_map[v], 1)
               # inline integer constants: 0→128, 1-64→129-192, -1 to -16→193-208
@@ -210,15 +228,15 @@ class RDNA3Renderer(ISARenderer):
           # regular register source
           r = s.reg
           if isinstance(r, Reg): return r
-          elif isinstance(r, Register): return Reg(r.index, 1)
+          elif isinstance(r, Register): return Reg(r.index, _reg_count(s.dtype))
           else:
             raise TypeError(f"oopsies for {s}")
 
       inst = u.arg
+      if isinstance(inst, RDNA3Ins.SOPP): return inst
       regs = [to_reg(s) for s in u.src]
-      dst = Reg(u.tag[0].index, 1) if isinstance(u.tag, tuple) else None
+      dst = Reg(u.tag[0].index, _reg_count(u.dtype)) if isinstance(u.tag, tuple) else None
 
-      print('filling for uop: ', u.arg)
       if isinstance(inst, RDNA3Ins.VOP2):
         return type(inst)(inst.op, vdst=dst, src0=regs[0], vsrc1=regs[1])
       elif isinstance(inst, RDNA3Ins.VOP1):
@@ -229,12 +247,12 @@ class RDNA3Renderer(ISARenderer):
         else:    # store
           return type(inst)(inst.op, addr=regs[0], data=regs[1], saddr=regs[2])
       elif isinstance(inst, RDNA3Ins.SMEM):
-        return type(inst)(inst.op, sdata=dst, sbase=regs[0], offset=inst.offset)
+        return type(inst)(inst.op, sdata=dst, sbase=regs[0], offset=inst.offset, soffset=NULL)
       elif isinstance(inst, (RDNA3Ins.SOP1,)):
         return type(inst)(inst.op, sdst=dst, src0=regs[0])
       elif isinstance(inst, (RDNA3Ins.SOP2,)):
         return type(inst)(inst.op, sdst=dst, src0=regs[0], src1=regs[1])
-      elif isinstance(inst, RDNA3Ins.SOPP):
+      elif isinstance(inst, (RDNA3Ins.SOPP, RDNA3Ins.SOPK)):
         return inst  # no register fields
       else:
         raise RuntimeError(f"fill_regs: unhandled {type(inst).__name__}")
