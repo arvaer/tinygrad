@@ -168,7 +168,6 @@ class TestCustomKernel(unittest.TestCase):
   def test_simple(self):
     if self.arch != "rdna3": self.skipTest("only rdna3")
     a = Tensor.full((16, 16), 1.).contiguous().realize()
-    print("beforE:", a.numpy())
     a = Tensor.custom_kernel(a, fxn=custom_add_one)[0]
     linear = compile_linear(a.schedule_linear())
     est = estimate_uop(linear.src[-1])
@@ -181,6 +180,7 @@ class TestCustomKernel(unittest.TestCase):
   def test_variable(self):
     if self.arch != "rdna3": self.skipTest("only rdna3")
     b = Tensor.full((16, 16), 1, dtype=dtypes.uint32).contiguous().realize()
+    print("b: ", b.numpy())
     a = Tensor.zeros_like(b).contiguous().realize()
     a = Tensor.custom_kernel(a, b, fxn=custom_add_var)[0]
     linear = a.schedule_linear()
@@ -193,8 +193,11 @@ class TestCustomKernel(unittest.TestCase):
     a = Tensor.empty(128, dtype=dtypes.int32).contiguous().realize()
     a = Tensor.custom_kernel(a, fxn=functools.partial(custom_lds_sync, arch=self.arch))[0]
     a.realize()
+    print("a: ", a.numpy())
     ref = Tensor.arange(1, 129, dtype=dtypes.int32)
+    print(ref.numpy())
     ref[127] = -1
+    print(ref.numpy())
     self.assertListEqual(a.tolist(), ref.tolist())
 
   def test_handwritten(self):

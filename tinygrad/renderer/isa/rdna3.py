@@ -9,8 +9,8 @@ from tinygrad.runtime.autogen.amd.rdna3 import ins as RDNA3Ins
 
 pre_isel_matcher = PatternMatcher([])
 
-SGPR = tuple(Register(f"s[{i}]", i) for i in range(106))
-VGPR = tuple(Register(f"v[{i}]", 256+i) for i in range(256))
+SGPR = tuple(Register(f"s{i}", i) for i in range(106))
+VGPR = tuple(Register(f"v{i}", 256+i) for i in range(256))
 
 def alloc_vregs(ctx:IselContext, x:UOp) -> UOp|None:
   """
@@ -47,7 +47,7 @@ def alloc_vregs(ctx:IselContext, x:UOp) -> UOp|None:
     return x.replace(tag=tuple(defs))
 
 
-pkernarg_segment = (Register("s[0]", 0), Register("s[1]", 1))
+pkernarg_segment = (Register("s0", 0), Register("s1", 1))
 def abi(ctx:IselContext, x:UOp) -> UOp|None:
   if isinstance(x.tag, tuple): return None # register
   i = ctx.func_args.index(x)
@@ -55,7 +55,7 @@ def abi(ctx:IselContext, x:UOp) -> UOp|None:
   if x.op is Ops.SPECIAL:
     if x.arg.startswith('gidx'):
       n = int(x.arg[-1])
-      wg = Register(f"s[{2+n}]", 2+n)
+      wg = Register(f"s{2+n}", 2+n)
       return x.ins(RDNA3Ins.v_mov_b32_e32(), src = (x.replace(tag=(wg,)),))
     return x.ins(RDNA3Ins.v_mov_b32_e32(), src = (x.replace(tag=(VGPR[0],)),))
 
@@ -88,11 +88,14 @@ def shift_index(x:UOp, base:UOp, idx:UOp) -> UOp:
 
 isel_matcher = PatternMatcher([
   (UPat(Ops.PARAM, name="x"),  abi),
-  (UPat(Ops.SPECIAL, name="x"), abi), 
+  (UPat(Ops.SPECIAL, name="x"), abi),
   (UPat.cvar("x", dtypes.float32), lambda ctx, x: x.ins(RDNA3Ins.v_mov_b32_e32(), src = (x.replace(tag=(ctx.vreg,)),)) if not x.tag else None),
+
+
   #(UPat.cvar("x", dtypes.int),     lambda ctx, x: x.ins(RDNA3Ins.v_mov_b32_e32(), src = (x.replace(tag=(ctx.vreg,)),)) if not x.tag else None),
 
  (UPat(Ops.RANGE, name="x"), lambda ctx, x: x.replace(tag=(ctx.vreg(VGPR),)) if not isinstance(x.tag, tuple) else None),
+ 
   (UPat(
     Ops.LOAD,
     src=(
@@ -104,8 +107,8 @@ isel_matcher = PatternMatcher([
    lambda x, base, idx: x.ins(RDNA3Ins.global_load_b32(), src=(shift_index(x,base,idx), base))),
 
 
-
-  (UPat.var("a", dtypes.float32) + UPat.var("b", dtype=dtypes.float32), lambda a, b: a.ins(RDNA3Ins.v_add_f32_e32(), src = (a,b))),
+  (UPat.var("a", dtypes.float32) + UPat.var("b", dtype=dtypes.float32), lambda a, b: a.ins(RDNA3Ins.v_add_f32_e32(), src = (b,a) if b.op is Ops.CONST else (a,b))),
+  (UPat.var("a", dtypes.ints) + UPat.var("b", dtype=dtypes.ints), lambda a, b: a.ins(RDNA3Ins.v_add_nc_u32_e32(), src = (b,a) if b.op is Ops.CONST else (a,b))),
   (UPat.var("a", dtypes.float32) * UPat.var("b", dtype=dtypes.float32), lambda a, b: a.ins(RDNA3Ins.v_mul_f32_e32(), src = (a,b))),
   (UPat(
     Ops.STORE,
@@ -182,6 +185,8 @@ class RDNA3Renderer(ISARenderer):
     targets: dict[str, int] = {}
     jumps: dict[UOp, int] = {}
     binary = bytearray()
+
+    print("Render uops \n", uops)
     for u in uops:
       if u.op is not Ops.INS: continue
       inst = u.arg
@@ -203,6 +208,7 @@ class RDNA3Renderer(ISARenderer):
       if not u.src and not isinstance(u.tag, tuple):return u
       return u.replace(arg=self.fill(u))
     insts = tuple(_bake(u) for u in lin.src)
+    print("Bake off: ",insts)
     return assemble_linear(prg, lin.replace(src=insts), self.target.arch)
 
   def fill(self, u:UOp) -> Inst:
@@ -224,7 +230,7 @@ class RDNA3Renderer(ISARenderer):
                   if 1 <= v <= 64: return Reg(128 + v, 1)
                   if -16 <= v <= -1: return Reg(192 - v, 1)
               # doesn't fit inline → 32-bit literal (encoding 255)
-              return Reg(255, 1)  # TODO: append literal bytes
+              return v
           # regular register source
           r = s.reg
           if isinstance(r, Reg): return r
