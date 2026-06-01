@@ -16,6 +16,10 @@ class LinearScanRegallocContext:
     # the label associated with each loop NOTE: this is only used post regalloc and should be removed
     self.loop_label: dict[UOp, str] = {}
 
+    for _i, _u in enumerate(uops):
+      print(f"[ctor] {_i:2d} {_u.op} {_u.arg} srclen:{len(_u.src)} (dtype:{_u.dtype})")
+      for s in _u.src:
+        print(f"{s.op} | {s.arg} | {s.tag} | {s.dtype}")
     # compute live ranges
     self.live_range: dict[Register, list[int]] = {}
     lr = self.live_range
@@ -109,12 +113,15 @@ class LinearScanRegallocContext:
 
 def regalloc_rewrite(ctx:LinearScanRegallocContext, x:UOp):
   i = next(ctx.idx)
+  print(f"[rw] {i:2d} {x.op} tag={x.tag!r}")
+  
   if x.op in PSEUDO_OPS: return None
   nsrc = []
   for j,s in enumerate(x.src):
     # v here is the virtual defined by the original s as s is the rewritten version
     if i in ctx.reals and (v:=ctx.uops[i].src[j].reg) in ctx.spills: nsrc.append(ctx.ren.fill(ctx.spills[v], ctx.vdef(v), ctx.reals[i][v]))
     else: nsrc.append(s)
+
   ndefs = tuple(ctx.reals[i][v] for v in x.tag) if isinstance(x.tag, tuple) else x.tag
   if x.op is Ops.DEFINE_LOCAL: nx = ctx.ren.isel_matcher.rewrite(ctx.ren.stack_pointer().index(ctx.locals[x], dtype=x.dtype, tag=ndefs))
   else: nx = x.replace(src=tuple(nsrc), tag=ndefs)

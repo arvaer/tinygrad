@@ -10,6 +10,7 @@ from tinygrad.runtime.autogen.amd.rdna3 import ins as RDNA3Ins
 pre_isel_matcher = PatternMatcher([])
 
 SGPR = tuple(Register(f"s{i}", i) for i in range(106))
+VCC = tuple(Register(f"s{i}", 106+i) for i in range(2))
 VGPR = tuple(Register(f"v{i}", 256+i) for i in range(256))
 
 def alloc_vregs(ctx:IselContext, x:UOp) -> UOp|None:
@@ -32,7 +33,7 @@ def alloc_vregs(ctx:IselContext, x:UOp) -> UOp|None:
       defs = [ctx.vreg(SGPR)]
     elif isinstance(inst, RDNA3Ins.SMEM):
       defs = [ctx.vreg(SGPR)]
-    elif isinstance(inst, RDNA3Ins.VOPC): defs = [ctx.vreg(SGPR)]
+    elif isinstance(inst, RDNA3Ins.VOPC): defs = [ctx.vreg(VCC)]
     elif isinstance(inst, (RDNA3Ins.VOP1_SDST, RDNA3Ins.VOP1_SDST_LIT, RDNA3Ins.VOP3_SDST_LIT, RDNA3Ins.VOP3_SDST)): defs = [ctx.vreg(SGPR)]
     elif isinstance(inst, RDNA3Ins.VOP3SD): defs = [ctx.vreg(SGPR), ctx.vreg(VGPR)]
     elif isinstance(inst, (RDNA3Ins.VOP1, RDNA3Ins.VOP2, RDNA3Ins.VOP3, RDNA3Ins.VOP3P, RDNA3Ins.VOPD)): defs = [ctx.vreg(VGPR)]
@@ -86,6 +87,19 @@ def shift_index(x:UOp, base:UOp, idx:UOp) -> UOp:
   shift_imm = UOp.const(dtypes.int, shift)
   return x.ins(RDNA3Ins.v_lshlrev_b32_e32(), src=(shift_imm, idx), dtype=dtypes.int)
 
+
+extra_matcher = PatternMatcher([
+  # bool CMPNE is XOR, bool CMPEQ is XOR+XOR, bool CMPLT is XOR+AND
+  (UPat.var('x', dtypes.bool).ne(UPat.var('y')), lambda x,y: x^y),
+  (UPat.var('x', dtypes.bool).alu(Ops.CMPEQ, UPat.var('y')), lambda x,y: (x^y)^True),
+  (UPat.var('x', dtypes.bool)<UPat.var('y'), lambda x,y: (x^True)&y),
+])
+
+def _materialize(ctx: IselContext, x: UOp) -> UOp:
+  if x.op is  Ops.CONST:
+    return x.ins(RDNA3Ins.v_mov_b32_e32(), src = (x.replace(tag = (ctx.vreg(VGPR),)),))
+  return x
+
 isel_matcher = PatternMatcher([
   (UPat(Ops.PARAM, name="x"),  abi),
   (UPat(Ops.SPECIAL, name="x"), abi),
@@ -110,6 +124,19 @@ isel_matcher = PatternMatcher([
   (UPat.var("a", dtypes.float32) + UPat.var("b", dtype=dtypes.float32), lambda a, b: a.ins(RDNA3Ins.v_add_f32_e32(), src = (b,a) if b.op is Ops.CONST else (a,b))),
   (UPat.var("a", dtypes.ints) + UPat.var("b", dtype=dtypes.ints), lambda a, b: a.ins(RDNA3Ins.v_add_nc_u32_e32(), src = (b,a) if b.op is Ops.CONST else (a,b))),
   (UPat.var("a", dtypes.float32) * UPat.var("b", dtype=dtypes.float32), lambda a, b: a.ins(RDNA3Ins.v_mul_f32_e32(), src = (a,b))),
+  (UPat.var("a", dtypes.sints) < UPat.var("b", dtype = dtypes.sints), lambda a, b: a.ins(RDNA3Ins.v_cmp_lt_i32_e32(), src = (a, b))),
+
+  (UPat (
+    Ops.WHERE,
+    src = (
+      UPat.var("p", dtypes.bool),
+      UPat.var("a"),
+      UPat.var("b")), name = "w"
+    ),
+   lambda ctx, w, p, a, b: w.ins(RDNA3Ins.v_cndmask_b32_e32(), src = (p, _materialize(ctx, b), _materialize(ctx, a)))),
+
+
+
   (UPat(
     Ops.STORE,
     src=(
@@ -157,6 +184,7 @@ class RDNA3Renderer(ISARenderer):
   global_max = (2147483647, 65535, 65535)
   global_prod_max = (0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF)
 
+  extra_matcher = extra_matcher
   pre_isel_matcher = pre_isel_matcher
   isel_matcher = isel_matcher
   post_regalloc_matcher = post_regalloc_matcher
@@ -243,7 +271,15 @@ class RDNA3Renderer(ISARenderer):
       regs = [to_reg(s) for s in u.src]
       dst = Reg(u.tag[0].index, _reg_count(u.dtype)) if isinstance(u.tag, tuple) else None
 
+      print("*" * 50)
+      print(f"type of inst: {inst}, and typed called {type(inst)}")
+      print(regs)
+      print(dst)
+      print("*" * 50)
+
       if isinstance(inst, RDNA3Ins.VOP2):
+        if inst.op is RDNA3Ins.VOP2Op.V_CNDMASK_B32_E32:
+          return type(inst)(inst.op, vdst = dst, src0=regs[1], vsrc1=regs[2])
         return type(inst)(inst.op, vdst=dst, src0=regs[0], vsrc1=regs[1])
       elif isinstance(inst, RDNA3Ins.VOP1):
         return type(inst)(inst.op, vdst=dst, src0=regs[0])
@@ -252,6 +288,8 @@ class RDNA3Renderer(ISARenderer):
           return type(inst)(inst.op, vdst=dst, addr=regs[0], saddr=regs[1])
         else:    # store
           return type(inst)(inst.op, addr=regs[0], data=regs[1], saddr=regs[2])
+      elif isinstance(inst, RDNA3Ins.VOPC):
+        return type(inst)(inst.op, src0 = regs[0], vsrc1=regs[1])
       elif isinstance(inst, RDNA3Ins.SMEM):
         return type(inst)(inst.op, sdata=dst, sbase=regs[0], offset=inst.offset, soffset=NULL)
       elif isinstance(inst, (RDNA3Ins.SOP1,)):
