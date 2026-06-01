@@ -2,7 +2,7 @@ from tinygrad.renderer.isa import ISARenderer, Register, IselContext
 from tinygrad.helpers import Target
 from tinygrad.uop.ops import UOp, UPat, PatternMatcher
 from tinygrad.renderer.amd.dsl import Inst, NULL
-from tinygrad.dtype import dtypes, PtrDType
+from tinygrad.dtype import dtypes, PtrDType, AddrSpace
 from tinygrad.uop import Ops
 
 from tinygrad.runtime.autogen.amd.rdna3 import ins as RDNA3Ins
@@ -70,7 +70,7 @@ def abi(ctx:IselContext, x:UOp) -> UOp|None:
     n_bufs = sum(1 for u in params if isinstance(u.dtype, PtrDType))
     var_idx = param_idx - n_bufs
     load = x.ins(RDNA3Ins.s_load_b32(offset=n_bufs * 8 + var_idx * 4), src=(base,))
-  # s_load is async: the value isn't in the sgpr until the lgkmcnt scoreboard drains. emit a wait, then
+  # s_load is async: the value isn't in the sgpr until the lgkmcnt drains. emit a wait, then
   # carry the loaded register through an AFTER so consumers are ordered *after* the wait (which is ordered
   # after the load). AFTER is a regalloc pseudo-op (no reg of its own); UOp.reg passes through to src[0]=load.
   wait = UOp(Ops.INS, dtypes.void, src=(load,), arg=RDNA3Ins.s_waitcnt_lgkmcnt(sdst=NULL, simm16=0))
@@ -97,8 +97,11 @@ extra_matcher = PatternMatcher([
 
 def _materialize(ctx: IselContext, x: UOp) -> UOp:
   if x.op is  Ops.CONST:
-    return x.ins(RDNA3Ins.v_mov_b32_e32(), src = (x.replace(tag = (ctx.vreg(VGPR),)),))
+    return x.ins(RDNA3Ins.v_mov_b32_e32(), src=(x,), tag=(ctx.vreg(VGPR),))
   return x
+
+def _is_global(base: UOp) -> bool:
+  return isinstance(base.dtype, PtrDType) and base.dtype.addrspace is AddrSpace.GLOBAL
 
 isel_matcher = PatternMatcher([
   (UPat(Ops.PARAM, name="x"),  abi),
@@ -109,7 +112,7 @@ isel_matcher = PatternMatcher([
   #(UPat.cvar("x", dtypes.int),     lambda ctx, x: x.ins(RDNA3Ins.v_mov_b32_e32(), src = (x.replace(tag=(ctx.vreg,)),)) if not x.tag else None),
 
  (UPat(Ops.RANGE, name="x"), lambda ctx, x: x.replace(tag=(ctx.vreg(VGPR),)) if not isinstance(x.tag, tuple) else None),
- 
+
   (UPat(
     Ops.LOAD,
     src=(
@@ -118,13 +121,13 @@ isel_matcher = PatternMatcher([
         src=(
           UPat(name="base"),
           UPat(name="idx")))), name="x"),
-   lambda x, base, idx: x.ins(RDNA3Ins.global_load_b32(), src=(shift_index(x,base,idx), base))),
+   lambda x, base, idx: x.ins(RDNA3Ins.global_load_b32() if _is_global(base) else RDNA3Ins.ds_load_b32(), src=(shift_index(x,base,idx), base))),
 
 
   (UPat.var("a", dtypes.float32) + UPat.var("b", dtype=dtypes.float32), lambda a, b: a.ins(RDNA3Ins.v_add_f32_e32(), src = (b,a) if b.op is Ops.CONST else (a,b))),
   (UPat.var("a", dtypes.ints) + UPat.var("b", dtype=dtypes.ints), lambda a, b: a.ins(RDNA3Ins.v_add_nc_u32_e32(), src = (b,a) if b.op is Ops.CONST else (a,b))),
   (UPat.var("a", dtypes.float32) * UPat.var("b", dtype=dtypes.float32), lambda a, b: a.ins(RDNA3Ins.v_mul_f32_e32(), src = (a,b))),
-  (UPat.var("a", dtypes.sints) < UPat.var("b", dtype = dtypes.sints), lambda a, b: a.ins(RDNA3Ins.v_cmp_lt_i32_e32(), src = (a, b))),
+  (UPat.var("a", dtypes.sints) < UPat.var("b", dtype = dtypes.sints), lambda ctx, a, b: a.ins(RDNA3Ins.v_cmp_lt_i32_e32(), src = (a, _materialize(ctx, b)))),
 
   (UPat (
     Ops.WHERE,
@@ -146,7 +149,8 @@ isel_matcher = PatternMatcher([
           UPat(name="base"),
           UPat(name="idx"))),
       UPat(name="val")), name="x"),
-   lambda x, base, idx, val: x.ins(RDNA3Ins.global_store_b32(), src=(shift_index(x, base, idx), val, base))),
+   lambda ctx, x, base, idx, val: x.ins(RDNA3Ins.global_store_b32() if _is_global(base) else RDNA3Ins.ds_store_b32(), src=(shift_index(x, base, idx), _materialize(ctx,val), base))),
+
   (UPat(Ops.SINK, name="x"), lambda x: x.replace(src=(x.ins(RDNA3Ins.s_endpgm(), src=x.src),)) if not x.src or x.src[0].op is not Ops.INS else None),
   (UPat((Ops.INS,), name="x"), alloc_vregs)
 ])
@@ -173,9 +177,7 @@ def lower_end(ctx, x:UOp):
 post_regalloc_matcher = PatternMatcher([
   (UPat(Ops.RANGE, name="x"), lower_range),
   (UPat(Ops.END, name="x"), lower_end),
-  # everything that isn't an instruction (SINK, operand leaves like CONST/PARAM/SPECIAL, defines, etc.) holds
-  # its register/metadata in .tag or in the sink; the INS that consume them bake it in via fill(). drop them
-  # all so LINEAR.src is all-INS — what do_assemble requires. RANGE/END are already lowered to INS above.
+  (UPat(Ops.BARRIER, name="x"), lambda x: x.ins(RDNA3Ins.s_barrier())),
   (UPat(tuple(o for o in Ops if o not in (Ops.INS, Ops.RANGE, Ops.END)), name="x"), lambda x: (x, [])),
 ])
 
@@ -198,6 +200,8 @@ class RDNA3Renderer(ISARenderer):
     raise NotImplementedError("scratch memory")
 
   def stack_pointer(Self):
+    print("We are here")
+    print(Self)
     raise NotImplementedError("no stack")
 
   def asm_str(self, uops:list[UOp], function_name:str) -> str:
@@ -236,7 +240,6 @@ class RDNA3Renderer(ISARenderer):
       if not u.src and not isinstance(u.tag, tuple):return u
       return u.replace(arg=self.fill(u))
     insts = tuple(_bake(u) for u in lin.src)
-    print("Bake off: ",insts)
     return assemble_linear(prg, lin.replace(src=insts), self.target.arch)
 
   def fill(self, u:UOp) -> Inst:
@@ -281,6 +284,9 @@ class RDNA3Renderer(ISARenderer):
         if inst.op is RDNA3Ins.VOP2Op.V_CNDMASK_B32_E32:
           return type(inst)(inst.op, vdst = dst, src0=regs[1], vsrc1=regs[2])
         return type(inst)(inst.op, vdst=dst, src0=regs[0], vsrc1=regs[1])
+      elif isinstance(inst, RDNA3Ins.DS):
+        if dst: return type(inst)(inst.op, vdst=dst, addr=regs[0])
+        else: return type(inst)(inst.op, addr=regs[0], data0=regs[1])
       elif isinstance(inst, RDNA3Ins.VOP1):
         return type(inst)(inst.op, vdst=dst, src0=regs[0])
       elif isinstance(inst, RDNA3Ins.GLOBAL):
