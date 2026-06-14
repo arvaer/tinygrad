@@ -1,4 +1,5 @@
 from tinygrad.renderer.isa import ISARenderer, Register, IselContext
+import pdb
 from tinygrad.helpers import Target
 from tinygrad.uop.ops import UOp, UPat, PatternMatcher
 from tinygrad.renderer.amd.dsl import Inst, NULL
@@ -61,6 +62,7 @@ def abi(ctx:IselContext, x:UOp) -> UOp|None:
     return x.ins(RDNA3Ins.v_mov_b32_e32(), src = (x.replace(tag=(VGPR[0],)),))
 
   params = [u for u in ctx.func_args if u.op is Ops.PARAM]
+  print("all params!:", params)
   param_idx = params.index(x)
   base = x.replace(tag=tuple(pkernarg_segment))
 
@@ -106,7 +108,7 @@ def _is_global(base: UOp) -> bool:
 isel_matcher = PatternMatcher([
   (UPat(Ops.PARAM, name="x"),  abi),
   (UPat(Ops.SPECIAL, name="x"), abi),
-  (UPat.cvar("x", dtypes.float32), lambda ctx, x: x.ins(RDNA3Ins.v_mov_b32_e32(), src = (x.replace(tag=(ctx.vreg,)),)) if not x.tag else None),
+  (UPat.cvar("x", dtypes.float32), lambda ctx, x: x.ins(RDNA3Ins.v_mov_b32_e32(), src = (x.replace(tag=(ctx.vreg(VGPR),)),)) if not x.tag else None),
 
 
   #(UPat.cvar("x", dtypes.int),     lambda ctx, x: x.ins(RDNA3Ins.v_mov_b32_e32(), src = (x.replace(tag=(ctx.vreg,)),)) if not x.tag else None),

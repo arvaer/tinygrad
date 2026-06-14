@@ -184,10 +184,19 @@ def do_to_program(ast:UOp, renderer:Renderer) -> UOp:
   Returns:
     The Ops.PROGRAM with SINK/DEVICE/LINEAR/SOURCE/BINARY.
   """
+  print("*"*50)
+  print("AST: ")
+  print(ast)
+  print()
   if ast.op is Ops.PROGRAM: prg = ast
   elif ast.op is Ops.SINK:
     assert isinstance(ast.arg, KernelInfo), "requires KernelInfo on arg to to_program"
     full_sink = full_rewrite_to_sink(ast, renderer, optimize=ast.tag is None)
+    print(full_sink)
+
+    print("*"*50)
+    print()
+    print()
     prog_info = ProgramInfo.from_sink(full_sink)
     # instruction selection
     if isinstance(renderer, ISARenderer):
